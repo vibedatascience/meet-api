@@ -8,7 +8,7 @@ import { config } from "./config.js";
 const MATON_KEY = process.env.MATON_KEY;
 const SECRET = process.env.SIGNING_SECRET || "dev-secret";
 const MEETING_LINK = process.env.MEETING_LINK || "";
-const PUBLIC_URL = process.env.PUBLIC_URL || "http://localhost:10000";
+const SITE_URL = process.env.SITE_URL || "https://rahulch.site";
 const GATEWAY = "https://gateway.maton.ai/outlook/";
 const GCAL = "https://gateway.maton.ai/google-calendar/calendar/v3/";
 
@@ -251,7 +251,7 @@ app.post("/api/book", async (c) => {
     } catch (e) {
       console.error("meet link skipped:", e.message);
     }
-    const cancelUrl = `${PUBLIC_URL}/cancel?t=${makeToken(startIso, email)}`;
+    const cancelUrl = `${SITE_URL}/meet/cancel/?t=${makeToken(startIso, email)}`;
     const guestWhen = start.setZone(guestTz).toFormat("ccc d LLL yyyy, h:mm a ZZZZ");
     const body = `
       <p><b>${esc(type.title)}</b> with ${esc(config.hostName)} and ${esc(name)}.</p>
@@ -297,7 +297,7 @@ async function findBooking(tok) {
   const s = utc(d.s);
   const r = await graph(
     `v1.0/me/calendarView?startDateTime=${s.minus({ minutes: 1 }).toISO()}&endDateTime=${s.plus({ minutes: 1 }).toISO()}` +
-      `&$select=subject,start,categories,attendees,isCancelled`
+      `&$select=subject,start,end,categories,attendees,isCancelled`
   );
   const ev = r.value.find(
     (e) => !e.isCancelled && (e.categories || []).includes(CATEGORY) &&
@@ -306,6 +306,42 @@ async function findBooking(tok) {
   return ev ? { ev, d } : null;
 }
 
+// JSON endpoints used by rahulch.site/meet/cancel/
+async function cancelBooking(f) {
+  await graph(`v1.0/me/events/${encodeURIComponent(f.ev.id)}/cancel`, {
+    method: "POST",
+    body: JSON.stringify({ comment: "Cancelled by the guest through rahulch.site/meet." }),
+  });
+  try {
+    await deleteMeet(f.d.s, f.d.e);
+  } catch (e) {
+    console.error("meet cleanup skipped:", e.message);
+  }
+  busyCache.at = 0;
+}
+
+app.get("/api/booking", async (c) => {
+  const f = await findBooking(c.req.query("t"));
+  if (!f) return c.json({ error: "not found" }, 404);
+  const s = utc(f.ev.start.dateTime), e = utc(f.ev.end.dateTime);
+  return c.json({
+    subject: f.ev.subject,
+    start: s.toISO({ suppressMilliseconds: true }),
+    minutes: Math.round(e.diff(s, "minutes").minutes),
+  });
+});
+
+app.post("/api/cancel", async (c) => {
+  const ip = c.req.header("x-forwarded-for")?.split(",")[0].trim() || "local";
+  if (limited(`cx:${ip}`, 10, 3600_000)) return c.json({ error: "Too many requests." }, 429);
+  const b = await c.req.json().catch(() => ({}));
+  const f = await findBooking(b.t);
+  if (!f) return c.json({ error: "This meeting was not found. It may already be cancelled." }, 404);
+  await cancelBooking(f);
+  return c.json({ ok: true });
+});
+
+// Older server-rendered cancel page, kept so earlier links still work.
 app.get("/cancel", async (c) => {
   const t = c.req.query("t");
   const f = await findBooking(t);
@@ -319,16 +355,7 @@ app.post("/cancel", async (c) => {
   const form = await c.req.parseBody();
   const f = await findBooking(form.t);
   if (!f) return c.html(page("This meeting was not found. It may already be cancelled."));
-  await graph(`v1.0/me/events/${encodeURIComponent(f.ev.id)}/cancel`, {
-    method: "POST",
-    body: JSON.stringify({ comment: "Cancelled by the guest through rahulch.site/meet." }),
-  });
-  try {
-    await deleteMeet(f.d.s, f.d.e);
-  } catch (e) {
-    console.error("meet cleanup skipped:", e.message);
-  }
-  busyCache.at = 0;
+  await cancelBooking(f);
   return c.html(page("Cancelled. Both calendars will update shortly."));
 });
 
