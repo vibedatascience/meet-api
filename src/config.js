@@ -23,7 +23,8 @@ export const config = {
   minNoticeHours: 12,     // earliest bookable time from now
   maxDaysAhead: 30,       // how far out guests can book
   maxPerDay: 4,           // cap on bookings made through this page per day
-  holidayCalendars: ["US Holidays"], // whole days blocked
+  googleBusyCalendars: ["primary"], // Google calendars whose busy times also block slots
+  holidayCalendars:["US Holidays"], // whole days blocked
   blockingShowAs:["busy", "tentative", "oof", "workingElsewhere"],
 
   allowedOrigins: [

@@ -10,6 +10,56 @@ const SECRET = process.env.SIGNING_SECRET || "dev-secret";
 const MEETING_LINK = process.env.MEETING_LINK || "";
 const PUBLIC_URL = process.env.PUBLIC_URL || "http://localhost:10000";
 const GATEWAY = "https://gateway.maton.ai/outlook/";
+const GCAL = "https://gateway.maton.ai/google-calendar/calendar/v3/";
+
+// ---------- Google Calendar via Maton (Meet links + extra busy times) ----------
+async function gcal(path, opts = {}) {
+  const r = await fetch(GCAL + path, {
+    ...opts,
+    signal: AbortSignal.timeout(8000),
+    headers: { Authorization: `Bearer ${MATON_KEY}`, "Content-Type": "application/json", ...(opts.headers || {}) },
+  });
+  if (r.status === 204) return null;
+  const body = await r.json().catch(() => null);
+  if (!r.ok) throw new Error(`gcal ${r.status}: ${body?.error?.message || ""}`);
+  return body;
+}
+
+const meetKey = (startIso, email) => crypto.createHash("sha256").update(`${startIso}|${email}`).digest("hex").slice(0, 32);
+
+// Placeholder event on Google Calendar that only exists to mint a Meet link.
+async function createMeet({ startIso, endIso, title, email }) {
+  const ev = await gcal("calendars/primary/events?conferenceDataVersion=1&sendUpdates=none", {
+    method: "POST",
+    body: JSON.stringify({
+      summary: `Meet link: ${title}`,
+      description: "Placeholder created by rahulch.site/meet. The real invite is on Outlook.",
+      transparency: "transparent",
+      start: { dateTime: startIso },
+      end: { dateTime: endIso },
+      extendedProperties: { private: { meetKey: meetKey(startIso, email) } },
+      conferenceData: { createRequest: { requestId: crypto.randomUUID(), conferenceSolutionKey: { type: "hangoutsMeet" } } },
+    }),
+  });
+  return ev.hangoutLink || null;
+}
+
+async function deleteMeet(startIso, email) {
+  const r = await gcal(`calendars/primary/events?privateExtendedProperty=${encodeURIComponent(`meetKey=${meetKey(startIso, email)}`)}`);
+  for (const e of r?.items || []) await gcal(`calendars/primary/events/${e.id}?sendUpdates=none`, { method: "DELETE" });
+}
+
+async function googleBusy(start, end) {
+  if (!config.googleBusyCalendars.length) return [];
+  const r = await gcal("freeBusy", {
+    method: "POST",
+    body: JSON.stringify({ timeMin: start, timeMax: end, items: config.googleBusyCalendars.map((id) => ({ id })) }),
+  });
+  return Object.values(r.calendars).flatMap((c) => c.busy || []).map((b) => ({
+    subject: "google busy", showAs: "busy", isCancelled: false,
+    start: { dateTime: b.start }, end: { dateTime: b.end },
+  }));
+}
 const CATEGORY = "Booked via rahulch.site";
 
 // ---------- Graph via Maton ----------
@@ -30,6 +80,7 @@ async function graph(path, opts = {}) {
   const text = await r.text();
   const body = text ? JSON.parse(text) : null;
   if (!r.ok) {
+    if (opts.onFail) await opts.onFail();
     const err = new Error(`graph ${r.status}: ${body?.error?.message || text}`);
     err.status = r.status;
     throw err;
@@ -66,6 +117,11 @@ async function getEvents(force = false) {
         end: { dateTime: day.plus({ days: 1 }).toUTC().toISO({ includeOffset: false }) },
       });
     }
+  }
+  try {
+    out.push(...(await googleBusy(start, end)));
+  } catch (e) {
+    console.error("google busy skipped:", e.message);
   }
   busyCache = { at: Date.now(), events: out };
   return out;
@@ -188,23 +244,31 @@ app.post("/api/book", async (c) => {
       return c.json({ error: "That time is no longer available. Pick another." }, 409);
 
     const end = start.plus({ minutes: type.minutes });
+    const endIso = end.toISO({ suppressMilliseconds: true });
+    let link = MEETING_LINK;
+    try {
+      link = (await createMeet({ startIso, endIso, title: `${name} <> ${config.hostName}`, email })) || MEETING_LINK;
+    } catch (e) {
+      console.error("meet link skipped:", e.message);
+    }
     const cancelUrl = `${PUBLIC_URL}/cancel?t=${makeToken(startIso, email)}`;
     const guestWhen = start.setZone(guestTz).toFormat("ccc d LLL yyyy, h:mm a ZZZZ");
     const body = `
       <p><b>${esc(type.title)}</b> with ${esc(config.hostName)} and ${esc(name)}.</p>
-      <p>${MEETING_LINK ? `Join: <a href="${esc(MEETING_LINK)}">${esc(MEETING_LINK)}</a>` : "Video link to follow by email."}</p>
+      <p>${link ? `Join Google Meet: <a href="${esc(link)}">${esc(link)}</a>` : "Video link to follow by email."}</p>
       ${notes ? `<p>Notes from ${esc(name)}:<br>${esc(notes).replace(/\n/g, "<br>")}</p>` : ""}
       <p>Need to cancel? <a href="${cancelUrl}">${cancelUrl}</a></p>
       <p style="color:#64748b">Booked through rahulch.site/meet for ${esc(guestWhen)}.</p>`;
 
     const ev = await graph("v1.0/me/events", {
+      onFail: () => link && link !== MEETING_LINK && deleteMeet(startIso, email).catch(() => {}),
       method: "POST",
       body: JSON.stringify({
         subject: `${name} <> ${config.hostName.split(" ")[0]} (${type.minutes} min)`,
         body: { contentType: "HTML", content: body },
         start: { dateTime: start.toFormat("yyyy-MM-dd'T'HH:mm:ss"), timeZone: "UTC" },
         end: { dateTime: end.toFormat("yyyy-MM-dd'T'HH:mm:ss"), timeZone: "UTC" },
-        location: { displayName: MEETING_LINK || "Video call" },
+        location: { displayName: link || "Video call" },
         attendees: [{ emailAddress: { address: email, name }, type: "required" }],
         categories: [CATEGORY],
         showAs: "busy",
@@ -216,7 +280,7 @@ app.post("/api/book", async (c) => {
       }),
     });
     busyCache.at = 0;
-    return c.json({ ok: true, start: startIso, end: end.toISO({ suppressMilliseconds: true }), id: ev.id.slice(-12) });
+    return c.json({ ok: true, start: startIso, end: endIso, meet: link || null, id: ev.id.slice(-12) });
   } finally {
     locks.delete(startIso);
   }
@@ -259,6 +323,11 @@ app.post("/cancel", async (c) => {
     method: "POST",
     body: JSON.stringify({ comment: "Cancelled by the guest through rahulch.site/meet." }),
   });
+  try {
+    await deleteMeet(f.d.s, f.d.e);
+  } catch (e) {
+    console.error("meet cleanup skipped:", e.message);
+  }
   busyCache.at = 0;
   return c.html(page("Cancelled. Both calendars will update shortly."));
 });
