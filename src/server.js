@@ -251,13 +251,16 @@ app.post("/api/book", async (c) => {
     } catch (e) {
       console.error("meet link skipped:", e.message);
     }
-    const cancelUrl = `${SITE_URL}/meet/cancel/?t=${makeToken(startIso, email)}`;
+    const tok = makeToken(startIso, email);
+    const cancelUrl = `${SITE_URL}/meet/cancel/?t=${tok}`;
+    const rescheduleUrl = `${SITE_URL}/meet/?reschedule=${tok}`;
     const guestWhen = start.setZone(guestTz).toFormat("ccc d LLL yyyy, h:mm a ZZZZ");
     const body = `
       <p><b>${esc(type.title)}</b> with ${esc(config.hostName)} and ${esc(name)}.</p>
       <p>${link ? `Join Google Meet: <a href="${esc(link)}">${esc(link)}</a>` : "Video link to follow by email."}</p>
       ${config.hostPhone ? `<p>Can't join the video call? You can also call ${esc(config.hostName.split(" ")[0])} at <a href="tel:${config.hostPhone.replace(/[^\d+]/g, "")}">${esc(config.hostPhone)}</a>.</p>` : ""}
       ${notes ? `<p>Notes from ${esc(name)}:<br>${esc(notes).replace(/\n/g, "<br>")}</p>` : ""}
+      <p>Need to reschedule? <a href="${rescheduleUrl}">${rescheduleUrl}</a></p>
       <p>Need to cancel? <a href="${cancelUrl}">${cancelUrl}</a></p>
       <p style="color:#64748b">Booked through rahulch.site/meet for ${esc(guestWhen)}.</p>`;
 
@@ -298,7 +301,7 @@ async function findBooking(tok) {
   const s = utc(d.s);
   const r = await graph(
     `v1.0/me/calendarView?startDateTime=${s.minus({ minutes: 1 }).toISO()}&endDateTime=${s.plus({ minutes: 1 }).toISO()}` +
-      `&$select=subject,start,end,categories,attendees,isCancelled`
+      `&$select=subject,start,end,categories,attendees,isCancelled,body`
   );
   const ev = r.value.find(
     (e) => !e.isCancelled && (e.categories || []).includes(CATEGORY) &&
@@ -325,11 +328,76 @@ app.get("/api/booking", async (c) => {
   const f = await findBooking(c.req.query("t"));
   if (!f) return c.json({ error: "not found" }, 404);
   const s = utc(f.ev.start.dateTime), e = utc(f.ev.end.dateTime);
+  const guest = (f.ev.attendees || []).find((a) => a.emailAddress.address.toLowerCase() === f.d.e);
   return c.json({
+    name: guest?.emailAddress.name || "",
+    email: f.d.e,
     subject: f.ev.subject,
     start: s.toISO({ suppressMilliseconds: true }),
     minutes: Math.round(e.diff(s, "minutes").minutes),
   });
+});
+
+app.post("/api/reschedule", async (c) => {
+  const ip = c.req.header("x-forwarded-for")?.split(",")[0].trim() || "local";
+  if (limited(`rs:${ip}`, 6, 3600_000)) return c.json({ error: "Too many requests." }, 429);
+  const b = await c.req.json().catch(() => ({}));
+  const f = await findBooking(b.t);
+  if (!f) return c.json({ error: "This meeting was not found. It may have been cancelled." }, 404);
+
+  const oldStart = utc(f.ev.start.dateTime);
+  const minutes = Math.round(utc(f.ev.end.dateTime).diff(oldStart, "minutes").minutes);
+  const start = DateTime.fromISO(String(b.start || ""), { zone: "utc" });
+  if (!start.isValid) return c.json({ error: "Pick a new time." }, 400);
+  const startIso = start.toISO({ suppressMilliseconds: true });
+  if (startIso === f.d.s) return c.json({ error: "That is the current time. Pick a different one." }, 400);
+  if (locks.has(startIso)) return c.json({ error: "That time was just taken. Pick another." }, 409);
+  locks.add(startIso);
+  try {
+    // The meeting being moved should not block its own new time.
+    const fresh = (await getEvents(true)).filter((e) => e.id !== f.ev.id);
+    if (!computeSlots(minutes, fresh).includes(startIso))
+      return c.json({ error: "That time is no longer available. Pick another." }, 409);
+
+    const end = start.plus({ minutes });
+    const endIso = end.toISO({ suppressMilliseconds: true });
+    const oldTok = String(b.t).trim();
+    const newTok = makeToken(startIso, f.d.e);
+    const guestTz = String(b.tz || "UTC").slice(0, 60);
+    const guestWhen = start.setZone(guestTz).toFormat("ccc d LLL yyyy, h:mm a ZZZZ");
+    const html = f.ev.body.content
+      .split(oldTok).join(newTok)
+      .replace(/(Booked through rahulch\.site\/meet for|Rescheduled through rahulch\.site\/meet to) [^<]+/,
+        `Rescheduled through rahulch.site/meet to ${esc(guestWhen)}.`);
+
+    await graph(`v1.0/me/events/${encodeURIComponent(f.ev.id)}`, {
+      method: "PATCH",
+      body: JSON.stringify({
+        start: { dateTime: start.toFormat("yyyy-MM-dd'T'HH:mm:ss"), timeZone: "UTC" },
+        end: { dateTime: end.toFormat("yyyy-MM-dd'T'HH:mm:ss"), timeZone: "UTC" },
+        body: { contentType: "HTML", content: html },
+      }),
+    });
+
+    // Move the Google placeholder so the Meet link stays tied to the new time.
+    try {
+      const r = await gcal(`calendars/primary/events?privateExtendedProperty=${encodeURIComponent(`meetKey=${meetKey(f.d.s, f.d.e)}`)}`);
+      for (const ge of r?.items || [])
+        await gcal(`calendars/primary/events/${ge.id}?sendUpdates=none`, {
+          method: "PATCH",
+          body: JSON.stringify({
+            start: { dateTime: startIso }, end: { dateTime: endIso },
+            extendedProperties: { private: { meetKey: meetKey(startIso, f.d.e) } },
+          }),
+        });
+    } catch (e) {
+      console.error("meet move skipped:", e.message);
+    }
+    busyCache.at = 0;
+    return c.json({ ok: true, start: startIso, end: endIso });
+  } finally {
+    locks.delete(startIso);
+  }
 });
 
 app.post("/api/cancel", async (c) => {
