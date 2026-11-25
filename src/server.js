@@ -1,0 +1,273 @@
+import { Hono } from "hono";
+import { cors } from "hono/cors";
+import { serve } from "@hono/node-server";
+import { DateTime, Interval } from "luxon";
+import crypto from "node:crypto";
+import { config } from "./config.js";
+
+const MATON_KEY = process.env.MATON_KEY;
+const SECRET = process.env.SIGNING_SECRET || "dev-secret";
+const MEETING_LINK = process.env.MEETING_LINK || "";
+const PUBLIC_URL = process.env.PUBLIC_URL || "http://localhost:10000";
+const GATEWAY = "https://gateway.maton.ai/outlook/";
+const CATEGORY = "Booked via rahulch.site";
+
+// ---------- Graph via Maton ----------
+async function graph(path, opts = {}) {
+  const url = path.startsWith("http")
+    ? path.replace("https://graph.microsoft.com/", GATEWAY)
+    : GATEWAY + path;
+  const r = await fetch(url, {
+    ...opts,
+    headers: {
+      Authorization: `Bearer ${MATON_KEY}`,
+      "Content-Type": "application/json",
+      Prefer: 'outlook.timezone="UTC"',
+      ...(opts.headers || {}),
+    },
+  });
+  if (r.status === 204) return null;
+  const text = await r.text();
+  const body = text ? JSON.parse(text) : null;
+  if (!r.ok) {
+    const err = new Error(`graph ${r.status}: ${body?.error?.message || text}`);
+    err.status = r.status;
+    throw err;
+  }
+  return body;
+}
+
+// Busy blocks from the default calendar, cached for 60 s.
+let busyCache = { at: 0, events: [] };
+async function getEvents(force = false) {
+  if (!force && Date.now() - busyCache.at < 60_000) return busyCache.events;
+  const start = DateTime.utc().minus({ days: 1 }).toISO();
+  const end = DateTime.utc().plus({ days: config.maxDaysAhead + 2 }).toISO();
+  let next =
+    `v1.0/me/calendarView?startDateTime=${start}&endDateTime=${end}` +
+    `&$select=subject,start,end,showAs,isAllDay,isCancelled,categories,attendees&$top=200`;
+  const out = [];
+  while (next) {
+    const page = await graph(next);
+    out.push(...page.value);
+    next = page["@odata.nextLink"];
+  }
+  // Holiday calendars: block the whole day in the host timezone.
+  const cals = (await graph("v1.0/me/calendars?$select=id,name")).value;
+  for (const cal of cals.filter((x) => config.holidayCalendars.includes(x.name))) {
+    const h = await graph(
+      `v1.0/me/calendars/${encodeURIComponent(cal.id)}/calendarView?startDateTime=${start}&endDateTime=${end}&$select=subject,start&$top=100`
+    );
+    for (const e of h.value) {
+      const day = DateTime.fromISO(e.start.dateTime.slice(0, 10), { zone: config.hostTz });
+      out.push({
+        subject: e.subject, showAs: "busy", isCancelled: false,
+        start: { dateTime: day.toUTC().toISO({ includeOffset: false }) },
+        end: { dateTime: day.plus({ days: 1 }).toUTC().toISO({ includeOffset: false }) },
+      });
+    }
+  }
+  busyCache = { at: Date.now(), events: out };
+  return out;
+}
+
+const utc = (s) => DateTime.fromISO(s.endsWith("Z") ? s : s + "Z", { zone: "utc" });
+
+function busyIntervals(events) {
+  const pad = { minutes: config.bufferMinutes };
+  return events
+    .filter((e) => !e.isCancelled && config.blockingShowAs.includes(e.showAs))
+    .map((e) => Interval.fromDateTimes(utc(e.start.dateTime).minus(pad), utc(e.end.dateTime).plus(pad)));
+}
+
+// ---------- slot math ----------
+function computeSlots(minutes, events) {
+  const tz = config.hostTz;
+  const busy = busyIntervals(events);
+  const earliest = DateTime.utc().plus({ hours: config.minNoticeHours });
+  const step = Math.min(minutes, 30);
+  const perDay = {};
+  for (const e of events) {
+    if (e.isCancelled || !(e.categories || []).includes(CATEGORY)) continue;
+    const d = utc(e.start.dateTime).setZone(tz).toISODate();
+    perDay[d] = (perDay[d] || 0) + 1;
+  }
+
+  const slots = [];
+  const today = DateTime.now().setZone(tz).startOf("day");
+  for (let i = 0; i <= config.maxDaysAhead; i++) {
+    const day = today.plus({ days: i });
+    if ((perDay[day.toISODate()] || 0) >= config.maxPerDay) continue;
+    for (const [a, b] of config.hours[day.weekday] || []) {
+      const [ah, am] = a.split(":").map(Number);
+      const [bh, bm] = b.split(":").map(Number);
+      const winEnd = day.set({ hour: bh, minute: bm });
+      for (let t = day.set({ hour: ah, minute: am }); t.plus({ minutes }) <= winEnd; t = t.plus({ minutes: step })) {
+        if (t < earliest) continue;
+        const iv = Interval.fromDateTimes(t, t.plus({ minutes }));
+        if (busy.some((bz) => bz.overlaps(iv))) continue;
+        slots.push(t.toUTC().toISO({ suppressMilliseconds: true }));
+      }
+    }
+  }
+  return slots;
+}
+
+// ---------- signed cancel tokens ----------
+const b64 = (s) => Buffer.from(s).toString("base64url");
+const sign = (payload) => crypto.createHmac("sha256", SECRET).update(payload).digest("base64url").slice(0, 22);
+function makeToken(start, email) {
+  const p = b64(JSON.stringify({ s: start, e: email.toLowerCase() }));
+  return `${p}.${sign(p)}`;
+}
+function readToken(tok) {
+  const [p, sig] = String(tok || "").split(".");
+  if (!p || !sig || sign(p) !== sig) return null;
+  try { return JSON.parse(Buffer.from(p, "base64url").toString()); } catch { return null; }
+}
+
+// ---------- abuse limits (in memory, reset on deploy) ----------
+const hits = new Map();
+function limited(key, max, windowMs) {
+  const now = Date.now();
+  const arr = (hits.get(key) || []).filter((t) => now - t < windowMs);
+  arr.push(now);
+  hits.set(key, arr);
+  return arr.length > max;
+}
+const locks = new Set();
+
+const esc = (s) => String(s).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/;
+
+// ---------- app ----------
+const app = new Hono();
+app.use("/api/*", cors({ origin: config.allowedOrigins, allowMethods: ["GET", "POST"] }));
+
+app.get("/healthz", (c) => c.text("ok"));
+
+app.get("/api/config", (c) =>
+  c.json({
+    host: config.hostName,
+    hostTz: config.hostTz,
+    eventTypes: config.eventTypes,
+    maxDaysAhead: config.maxDaysAhead,
+    hasMeetingLink: Boolean(MEETING_LINK),
+  })
+);
+
+app.get("/api/slots", async (c) => {
+  const type = config.eventTypes[c.req.query("type") || "30"];
+  if (!type) return c.json({ error: "unknown type" }, 400);
+  const events = await getEvents();
+  return c.json({ type: type.minutes, slots: computeSlots(type.minutes, events) });
+});
+
+app.post("/api/book", async (c) => {
+  const ip = c.req.header("x-forwarded-for")?.split(",")[0].trim() || "local";
+  if (limited(`ip:${ip}`, 5, 3600_000)) return c.json({ error: "Too many requests. Try again later." }, 429);
+
+  const b = await c.req.json().catch(() => ({}));
+  if (b.website) return c.json({ ok: true }); // honeypot: pretend success
+  const type = config.eventTypes[String(b.type)];
+  const name = String(b.name || "").trim().slice(0, 80);
+  const email = String(b.email || "").trim().toLowerCase().slice(0, 120);
+  const notes = String(b.notes || "").trim().slice(0, 1500);
+  const guestTz = String(b.tz || "UTC").slice(0, 60);
+  const start = DateTime.fromISO(String(b.start || ""), { zone: "utc" });
+  if (!type || !name || !EMAIL_RE.test(email) || !start.isValid)
+    return c.json({ error: "Name, a valid email and a time are required." }, 400);
+  if (limited(`em:${email}`, 2, 86400_000)) return c.json({ error: "You already booked today." }, 429);
+
+  const startIso = start.toISO({ suppressMilliseconds: true });
+  if (locks.has(startIso)) return c.json({ error: "That time was just taken. Pick another." }, 409);
+  locks.add(startIso);
+  try {
+    const fresh = await getEvents(true);
+    if (!computeSlots(type.minutes, fresh).includes(startIso))
+      return c.json({ error: "That time is no longer available. Pick another." }, 409);
+
+    const end = start.plus({ minutes: type.minutes });
+    const cancelUrl = `${PUBLIC_URL}/cancel?t=${makeToken(startIso, email)}`;
+    const guestWhen = start.setZone(guestTz).toFormat("ccc d LLL yyyy, h:mm a ZZZZ");
+    const body = `
+      <p><b>${esc(type.title)}</b> with ${esc(config.hostName)} and ${esc(name)}.</p>
+      <p>${MEETING_LINK ? `Join: <a href="${esc(MEETING_LINK)}">${esc(MEETING_LINK)}</a>` : "Video link to follow by email."}</p>
+      ${notes ? `<p>Notes from ${esc(name)}:<br>${esc(notes).replace(/\n/g, "<br>")}</p>` : ""}
+      <p>Need to cancel? <a href="${cancelUrl}">${cancelUrl}</a></p>
+      <p style="color:#64748b">Booked through rahulch.site/meet for ${esc(guestWhen)}.</p>`;
+
+    const ev = await graph("v1.0/me/events", {
+      method: "POST",
+      body: JSON.stringify({
+        subject: `${name} <> ${config.hostName.split(" ")[0]} (${type.minutes} min)`,
+        body: { contentType: "HTML", content: body },
+        start: { dateTime: start.toFormat("yyyy-MM-dd'T'HH:mm:ss"), timeZone: "UTC" },
+        end: { dateTime: end.toFormat("yyyy-MM-dd'T'HH:mm:ss"), timeZone: "UTC" },
+        location: { displayName: MEETING_LINK || "Video call" },
+        attendees: [{ emailAddress: { address: email, name }, type: "required" }],
+        categories: [CATEGORY],
+        showAs: "busy",
+        isReminderOn: true,
+        reminderMinutesBeforeStart: 10,
+        responseRequested: true,
+        allowNewTimeProposals: true,
+        transactionId: crypto.createHash("sha256").update(startIso + email).digest("hex").slice(0, 36),
+      }),
+    });
+    busyCache.at = 0;
+    return c.json({ ok: true, start: startIso, end: end.toISO({ suppressMilliseconds: true }), id: ev.id.slice(-12) });
+  } finally {
+    locks.delete(startIso);
+  }
+});
+
+// Cancel page (linked from the invite body)
+const page = (msg, form = "") => `<!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width">
+<title>Cancel meeting</title><body style="font:13px/1.45 system-ui,sans-serif;margin:10px 12px;color:#0f172a">
+<p>${msg}</p>${form}<p><a href="https://rahulch.site/meet/">rahulch.site/meet</a></p></body>`;
+
+async function findBooking(tok) {
+  const d = readToken(tok);
+  if (!d) return null;
+  const s = utc(d.s);
+  const r = await graph(
+    `v1.0/me/calendarView?startDateTime=${s.minus({ minutes: 1 }).toISO()}&endDateTime=${s.plus({ minutes: 1 }).toISO()}` +
+      `&$select=subject,start,categories,attendees,isCancelled`
+  );
+  const ev = r.value.find(
+    (e) => !e.isCancelled && (e.categories || []).includes(CATEGORY) &&
+      (e.attendees || []).some((a) => a.emailAddress.address.toLowerCase() === d.e)
+  );
+  return ev ? { ev, d } : null;
+}
+
+app.get("/cancel", async (c) => {
+  const t = c.req.query("t");
+  const f = await findBooking(t);
+  if (!f) return c.html(page("This meeting was not found. It may already be cancelled."));
+  const when = utc(f.ev.start.dateTime).setZone(config.hostTz).toFormat("ccc d LLL, h:mm a ZZZZ");
+  return c.html(page(`Cancel <b>${esc(f.ev.subject)}</b> on ${esc(when)}?`,
+    `<form method="post"><input type="hidden" name="t" value="${esc(t)}"><button style="font:inherit;padding:4px 10px;background:#E60023;color:#fff;border:0">Cancel meeting</button></form>`));
+});
+
+app.post("/cancel", async (c) => {
+  const form = await c.req.parseBody();
+  const f = await findBooking(form.t);
+  if (!f) return c.html(page("This meeting was not found. It may already be cancelled."));
+  await graph(`v1.0/me/events/${encodeURIComponent(f.ev.id)}/cancel`, {
+    method: "POST",
+    body: JSON.stringify({ comment: "Cancelled by the guest through rahulch.site/meet." }),
+  });
+  busyCache.at = 0;
+  return c.html(page("Cancelled. Both calendars will update shortly."));
+});
+
+app.onError((err, c) => {
+  console.error(err);
+  return c.json({ error: "Something went wrong. Try again in a minute." }, 500);
+});
+
+const port = Number(process.env.PORT || 10000);
+serve({ fetch: app.fetch, port });
+console.log(`meet-api on :${port}`);

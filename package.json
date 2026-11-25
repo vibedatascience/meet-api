@@ -1,0 +1,21 @@
+{
+  "name": "meet-api",
+  "version": "1.0.0",
+  "description": "",
+  "main": "src/server.js",
+  "scripts": {
+    "start": "node src/server.js"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "@hono/node-server": "^2.1.11",
+    "hono": "^4.13.22",
+    "luxon": "^3.7.2"
+  },
+  "type": "module",
+  "engines": {
+    "node": ">=20"
+  }
+}
