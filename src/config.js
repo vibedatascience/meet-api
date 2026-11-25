@@ -3,6 +3,7 @@ export const config = {
   hostName: "Rahul Chaudhary",
   hostEmail: "rahul.chaudhary@outlook.com",
   hostTz: "America/New_York",
+  hostPhone: "+1 (513) 888-2930", // shown in invites as a backup to the video link
 
   eventTypes: {
     "15": { minutes: 15, title: "15 min intro" },

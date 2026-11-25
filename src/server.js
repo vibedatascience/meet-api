@@ -256,6 +256,7 @@ app.post("/api/book", async (c) => {
     const body = `
       <p><b>${esc(type.title)}</b> with ${esc(config.hostName)} and ${esc(name)}.</p>
       <p>${link ? `Join Google Meet: <a href="${esc(link)}">${esc(link)}</a>` : "Video link to follow by email."}</p>
+      ${config.hostPhone ? `<p>Can't join the video call? You can also call ${esc(config.hostName.split(" ")[0])} at <a href="tel:${config.hostPhone.replace(/[^\d+]/g, "")}">${esc(config.hostPhone)}</a>.</p>` : ""}
       ${notes ? `<p>Notes from ${esc(name)}:<br>${esc(notes).replace(/\n/g, "<br>")}</p>` : ""}
       <p>Need to cancel? <a href="${cancelUrl}">${cancelUrl}</a></p>
       <p style="color:#64748b">Booked through rahulch.site/meet for ${esc(guestWhen)}.</p>`;
